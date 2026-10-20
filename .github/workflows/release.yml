@@ -1,0 +1,23 @@
+name: release
+# A tag v<version> (the maintainer's) makes a GitHub release with the script and its .sha256.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: The tag is the script's version
+        run: |
+          v=$(sed -n 's/^VERSION=//p' occulite-backup)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "the script says $v, the tag $GITHUB_REF_NAME"; exit 1; }
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck busybox
+      - run: shellcheck -s sh occulite-backup tests/run.sh
+      - run: sh tests/run.sh && TEST_SH="busybox sh" sh tests/run.sh
+      - run: sha256sum occulite-backup > occulite-backup.sha256
+      - run: gh release create "$GITHUB_REF_NAME" occulite-backup occulite-backup.sha256 --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

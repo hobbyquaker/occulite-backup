@@ -1,0 +1,259 @@
+#!/bin/sh
+# occulite-backup - download the backups of openccu-lite systems.
+#
+# One POSIX shell script, curl the only dependency: runs on a Linux server, a NAS (Synology, QNAP)
+# or a router with busybox. It fetches GET /api/system/v1/backup with a token that holds the
+# "backup" scope, checks the download, and keeps the newest N backups per system.
+#
+#   occulite-backup --host https://ccu.example --token-file /etc/occulite-backup/ccu.token \
+#                   --ca /etc/occulite-backup/ccu.pem --target /volume1/backup/ccu --keep 7
+#   occulite-backup --config /etc/occulite-backup/systems.conf
+#
+# See README.md (English) and README.de.md (German). MIT licence.
+set -u
+# a backup holds the system's radio keys: what this script writes is the user's alone
+umask 077
+
+VERSION=1.0.0
+PROG=occulite-backup
+
+usage() {
+  cat <<USAGE
+Usage: $PROG [options] --host URL (--token-file FILE | \$OCCULITE_TOKEN)
+       $PROG --config FILE [options]
+
+Downloads the current backup of an openccu-lite system (GET /api/system/v1/backup) with a token
+that holds the "backup" scope, checks it, and keeps the newest N backups of that system.
+
+  --host URL          the system, https://name-or-address[:port]
+  --token-file FILE   a file with the token (its first line); else \$OCCULITE_TOKEN
+  --ca FILE           the system's certificate (or its CA) in PEM, for a self-signed one
+  --insecure          do not check the certificate at all (last resort; see the README)
+  --target DIR        where the backups go (default: the current directory)
+  --keep N            keep the newest N backups of the system there, delete older ones
+                      after a checked new one (default: 0 = keep all)
+  --name NAME         the system's name in the summary (default: the host)
+  --timeout SECONDS   for the whole download (default: 1800; the system builds the backup first)
+  --config FILE       several systems, one line each (see the README); the options above then
+                      are the defaults for every line
+  --version           print the version
+  --help              this text
+
+Exit status: 0 when every backup was downloaded and checked, 1 when one failed, 2 for a usage error.
+USAGE
+}
+
+say() { printf '%s\n' "$*"; }
+err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+# defaults, from the command line; a config line overrides them per system
+D_HOST=; D_TOKEN_FILE=; D_CA=; D_INSECURE=no; D_TARGET=.; D_KEEP=0; D_NAME=; D_TIMEOUT=1800
+CONFIG=
+
+need_arg() { [ "$2" -ge 2 ] || { err "$1 needs a value"; exit 2; }; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host) need_arg "$1" $#; D_HOST=$2; shift 2 ;;
+    --token-file) need_arg "$1" $#; D_TOKEN_FILE=$2; shift 2 ;;
+    --ca) need_arg "$1" $#; D_CA=$2; shift 2 ;;
+    --insecure) D_INSECURE=yes; shift ;;
+    --target) need_arg "$1" $#; D_TARGET=$2; shift 2 ;;
+    --keep) need_arg "$1" $#; D_KEEP=$2; shift 2 ;;
+    --name) need_arg "$1" $#; D_NAME=$2; shift 2 ;;
+    --timeout) need_arg "$1" $#; D_TIMEOUT=$2; shift 2 ;;
+    --config) need_arg "$1" $#; CONFIG=$2; shift 2 ;;
+    --version) say "$PROG $VERSION"; exit 0 ;;
+    --help|-h) usage; exit 0 ;;
+    --token) err "the token is not given on the command line (it would show in the process list); use --token-file or OCCULITE_TOKEN"; exit 2 ;;
+    *) err "unknown option: $1"; usage >&2; exit 2 ;;
+  esac
+done
+
+command -v curl >/dev/null 2>&1 || { err "curl is not installed"; exit 2; }
+
+is_count() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
+is_count "$D_KEEP" || { err "--keep is a number, not $D_KEEP"; exit 2; }
+is_count "$D_TIMEOUT" && [ "$D_TIMEOUT" -gt 0 ] || { err "--timeout is a number of seconds, not $D_TIMEOUT"; exit 2; }
+
+TMPD=$(mktemp -d 2>/dev/null) || { err "no temporary directory"; exit 1; }
+[ -d "$TMPD" ] || { err "no temporary directory"; exit 1; }
+cleanup() { rm -rf "${TMPD:?}"; }
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+# the system's own name for its backup, from Content-Disposition: a plain file name ending in
+# .sbk or .sbk.age, nothing else (no path, no quotes, no control characters)
+disposition_name() {
+  n=$(tr -d '\r' <"$1" | sed -n 's/^[Cc]ontent-[Dd]isposition:.*filename="\{0,1\}\([^";]*\)"\{0,1\}.*$/\1/p' | tail -n 1)
+  n=${n##*/}
+  case "$n" in
+    ''|.*|*[!A-Za-z0-9._-]*) return 1 ;;
+    *.sbk|*.sbk.age) printf '%s\n' "$n" ;;
+    *) return 1 ;;
+  esac
+}
+
+# header_value <headers file> <lower-case name>: the value in the last response's headers
+header_value() {
+  tr -d '\r' <"$1" | awk -v want="$2" '/^HTTP\//{v=""} {k=tolower($1); sub(/:$/, "", k)} k==want {sub(/^[^:]*:[ \t]*/, ""); v=$0} END{print v}'
+}
+
+# the system part of a backup's name: <hostname>-<version>-YYYY-MM-DD-HHMM.sbk[.age], as the CCU's
+# createBackup.sh names it; nothing for another name (then --keep leaves the folder alone)
+host_part() {
+  printf '%s\n' "$1" | sed -n 's/^\(.*[^-]\)-[0-9][0-9.]*-[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}-[0-9]\{4\}\.sbk\(\.age\)\{0,1\}$/\1/p'
+}
+
+# prune <dir> <host part> <n>: delete all but the newest n backups of that system (by time)
+prune() {
+  dir=$1; hp=$2; n=$3
+  [ "$n" -gt 0 ] || return 0
+  # shellcheck disable=SC2012 # the names are matched below; ls -t is the portable sort by time
+  ls -1t "$dir" 2>/dev/null | while IFS= read -r f; do
+    [ "$(host_part "$f")" = "$hp" ] && printf '%s\n' "$f"
+  done | tail -n +"$((n + 1))" | while IFS= read -r f; do
+    if rm -f "${dir:?}/${f:?}"; then say "  removed $f (keeping $n)"; else err "could not remove $dir/$f"; fi
+  done
+}
+
+# fail <reason>: the partial download goes, one summary line
+fail() {
+  rm -f "${part:?}"
+  say "FAIL $label: $*"
+}
+
+# backup_one: one system with HOST TOKEN_FILE CA INSECURE TARGET KEEP NAME TIMEOUT set; prints the
+# summary line, returns 0 or 1
+backup_one() {
+  label=${NAME:-$HOST}
+  case "$HOST" in
+    https://?*) ;;
+    http://*) say "FAIL $label: $HOST is not https:// - the token and the backup would cross the network in the clear"; return 1 ;;
+    *) say "FAIL $label: the host is https://name-or-address, not '$HOST'"; return 1 ;;
+  esac
+  HOST=${HOST%/}
+  if [ -n "$TOKEN_FILE" ]; then
+    [ -r "$TOKEN_FILE" ] || { say "FAIL $label: cannot read the token file $TOKEN_FILE"; return 1; }
+    token=$(head -n 1 "$TOKEN_FILE" | tr -d ' \t\r\n')
+  else
+    token=$(printf '%s' "${OCCULITE_TOKEN:-}" | tr -d ' \t\r\n')
+  fi
+  [ -n "$token" ] || { say "FAIL $label: no token (--token-file or OCCULITE_TOKEN)"; return 1; }
+  case "$token" in *[!A-Za-z0-9._~+/=-]*) say "FAIL $label: the token holds characters a token does not have"; return 1 ;; esac
+  [ -d "$TARGET" ] || { say "FAIL $label: the target $TARGET is not a directory"; return 1; }
+  [ -w "$TARGET" ] || { say "FAIL $label: cannot write to $TARGET"; return 1; }
+  is_count "$KEEP" || { say "FAIL $label: keep is a number, not $KEEP"; return 1; }
+  is_count "$TIMEOUT" && [ "$TIMEOUT" -gt 0 ] || { say "FAIL $label: timeout is a number of seconds, not $TIMEOUT"; return 1; }
+
+  # the token goes to curl in a file (-H @file), never on its command line
+  hdr="$TMPD/auth"
+  (umask 077 && printf 'Authorization: Bearer %s\n' "$token" >"$hdr")
+  part="$TARGET/.occulite-backup.$$.part"
+  heads="$TMPD/headers"
+  set -- -sS -o "$part" -D "$heads" -w '%{http_code} %{size_download}' -H "@$hdr" \
+    --connect-timeout 30 --max-time "$TIMEOUT" --proto '=https' --tlsv1.2
+  if [ "$INSECURE" = yes ]; then
+    set -- "$@" -k
+  elif [ -n "$CA" ]; then
+    [ -r "$CA" ] || { rm -f "${hdr:?}"; say "FAIL $label: cannot read the CA file $CA"; return 1; }
+    set -- "$@" --cacert "$CA"
+  fi
+  out=$(curl "$@" "$HOST/api/system/v1/backup" 2>"$TMPD/curl.err")
+  rc=$?
+  rm -f "${hdr:?}"
+  code=${out%% *}
+  got=${out#* }
+  if [ "$rc" != 0 ]; then
+    fail "the download failed (curl $rc: $(head -n 1 "$TMPD/curl.err"))"; return 1
+  fi
+  case "$code" in
+    200) ;;
+    401) fail "HTTP 401: the token is not accepted (wrong, expired or deleted)"; return 1 ;;
+    403) fail "HTTP 403: the token lacks the backup scope, or is not allowed from this address"; return 1 ;;
+    *) fail "HTTP $code from the system"; return 1 ;;
+  esac
+  [ -f "$part" ] || { fail "nothing was downloaded"; return 1; }
+  size=$(wc -c <"$part" | tr -d ' ')
+  [ "$size" -gt 0 ] || { fail "the download is empty"; return 1; }
+  [ "$size" = "$got" ] || { fail "curl counted $got bytes, the file has $size"; return 1; }
+  len=$(header_value "$heads" content-length)
+  if [ -n "$len" ] && [ "$len" != "$size" ]; then
+    fail "incomplete: $size of $len bytes"; return 1
+  fi
+  name=$(disposition_name "$heads") || { fail "the system named no backup file (Content-Disposition)"; return 1; }
+  case "$name" in
+    *.sbk.age)
+      [ "$(head -n 1 "$part")" = "age-encryption.org/v1" ] || { fail "$name is not an age file"; return 1; } ;;
+    *.sbk)
+      # a CCU backup is a plain tar of usr_local.tar.gz, its signature and the firmware version
+      tar -tf "$part" 2>/dev/null >"$TMPD/list" || { fail "$name is not a readable backup archive (tar -tf)"; return 1; }
+      grep -qx 'usr_local.tar.gz' "$TMPD/list" || { fail "$name holds no usr_local.tar.gz"; return 1; } ;;
+  esac
+  mv -f "$part" "$TARGET/$name" || { fail "could not move it to $TARGET/$name"; return 1; }
+  say "ok   $label: $TARGET/$name ($size bytes)"
+  if [ "$KEEP" -gt 0 ]; then
+    hp=$(host_part "$name")
+    if [ -n "$hp" ]; then
+      prune "$TARGET" "$hp" "$KEEP"
+    else
+      say "  not pruned: $name is not named <host>-<version>-<date>-<time>.sbk"
+    fi
+  fi
+  return 0
+}
+
+set_defaults() {
+  HOST=$D_HOST; TOKEN_FILE=$D_TOKEN_FILE; CA=$D_CA; INSECURE=$D_INSECURE; TARGET=$D_TARGET
+  KEEP=$D_KEEP; NAME=$D_NAME; TIMEOUT=$D_TIMEOUT
+}
+
+failed=0
+total=0
+if [ -n "$CONFIG" ]; then
+  [ -r "$CONFIG" ] || { err "cannot read $CONFIG"; exit 2; }
+  lineno=0
+  # one system per line: key=value settings separated by blanks; # starts a comment
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    line=${line%%#*}
+    case "$line" in *[!\ \	]*) ;; *) continue ;; esac
+    set_defaults
+    bad=
+    set -f
+    # shellcheck disable=SC2086 # word splitting is the format
+    set -- $line
+    set +f
+    for kv in "$@"; do
+      v=${kv#*=}
+      case "$kv" in
+        name=*) NAME=$v ;;
+        host=*) HOST=$v ;;
+        token_file=*) TOKEN_FILE=$v ;;
+        ca=*) CA=$v ;;
+        insecure=*) case "$v" in yes|true|1) INSECURE=yes ;; *) INSECURE=no ;; esac ;;
+        target=*) TARGET=$v ;;
+        keep=*) KEEP=$v ;;
+        timeout=*) TIMEOUT=$v ;;
+        *) bad=$kv ;;
+      esac
+    done
+    total=$((total + 1))
+    if [ -n "$bad" ]; then
+      say "FAIL $CONFIG:$lineno: unknown setting '$bad'"
+      failed=$((failed + 1))
+      continue
+    fi
+    backup_one </dev/null || failed=$((failed + 1))
+  done <"$CONFIG"
+  [ "$total" -gt 0 ] || { err "$CONFIG names no system"; exit 2; }
+else
+  [ -n "$D_HOST" ] || { usage >&2; exit 2; }
+  set_defaults
+  total=1
+  backup_one || failed=1
+fi
+
+if [ "$total" -gt 1 ]; then
+  say "$((total - failed)) of $total backups downloaded and checked"
+fi
+[ "$failed" = 0 ]
