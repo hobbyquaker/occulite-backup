@@ -6,7 +6,10 @@ Downloads the backups of [openccu-lite](https://github.com/hobbyquaker/openccu-l
 script, `curl` its only dependency. It runs on a Linux server, on a NAS (Synology, QNAP) and on a router with
 busybox, from cron or a systemd timer.
 
-- fetches the current backup (`GET /api/system/v1/backup`) with an API token that may do nothing but backups;
+- has the system build a fresh backup and downloads it, with an API token that may do nothing but backups: it starts
+  the backup (`POST /api/system/v1/backup/prepare`), waits until it is ready and then fetches the file
+  (`GET /api/system/v1/backup?prepared=<id>`); a system before openccu-lite 1.0.0-beta.12 gets the plain
+  `GET /api/system/v1/backup` over HTTP/1.1;
 - **checks the download** before anything older is touched: HTTP 200, not empty, as long as the system said, and
   readable - a `.sbk` must open as the CCU's archive (a tar with `usr_local.tar.gz` in it), an encrypted `.sbk.age` must start with the age header. A failed
   download is removed and the run fails;
@@ -83,7 +86,15 @@ ok   https://ccu.example: /srv/backup/ccu/ccu-3.89.11.20260919-2026-10-20-0300.s
 ```
 
 The token can also come from the environment, `OCCULITE_TOKEN`, instead of `--token-file`. The system builds the
-backup when asked; that takes a minute or two on a small board, so the default `--timeout` is 1800 seconds.
+backup when asked; that takes a minute or two on a small board and ten minutes or more with a large `/usr/local`
+(big addons), so the default `--timeout` is 1800 seconds - for the building, and again for the download. The script
+asks every `--poll` seconds (5) whether it is ready. Stopped while the system builds it (Ctrl-C, `SIGTERM`, the
+timeout), the script cancels that backup on the system, so its file does not wait there.
+
+**openccu-lite 1.0.0-beta.12 or later is recommended for large backups.** From that version on the system builds the
+backup first and hands it out when it is complete. An older system builds it while the download waits; the script
+then uses HTTP/1.1, which works for any size as long as nothing between the two machines (a reverse proxy) cuts a
+long wait short.
 
 | Option | |
 | --- | --- |
@@ -94,7 +105,8 @@ backup when asked; that takes a minute or two on a small board, so the default `
 | `--target DIR` | where the backups go (default: the current directory) |
 | `--keep N` | keep the newest N backups of this system there (default 0: keep all) |
 | `--name NAME` | the system's name in the summary |
-| `--timeout SECONDS` | for the whole download (default 1800) |
+| `--timeout SECONDS` | for the system to build the backup, and again for its download (default 1800) |
+| `--poll SECONDS` | how often to ask whether the backup is ready (default 5) |
 | `--config FILE` | several systems, see below |
 
 `--keep` counts the files of **this system** only, by the host name at the start of the system's file names
@@ -104,7 +116,7 @@ file are left alone. Nothing is deleted when the new download failed.
 ## Several systems
 
 One line per system, `key=value` settings separated by blanks (no blanks inside a value); `#` starts a comment.
-Settings: `name`, `host`, `token_file`, `ca`, `insecure` (`yes`), `target`, `keep`, `timeout`. Options given on the
+Settings: `name`, `host`, `token_file`, `ca`, `insecure` (`yes`), `target`, `keep`, `timeout`, `poll`. Options given on the
 command line are the defaults for every line.
 
 ```
@@ -186,7 +198,10 @@ journalctl -u occulite-backup.service     # the last runs
 | `HTTP 401: the token is not accepted` | a wrong, expired or deleted token - or one not allowed from the address the request came from (IPv6, see step 1) |
 | `HTTP 403` | the token lacks the *Backups* permission |
 | `curl 60 … self-signed certificate` | `--ca` is missing or names another certificate (step 2) |
-| `curl 16` / `curl 18` / `curl 52` after about six minutes | the system needed longer than its web server waits to build the backup (a large `/usr/local`, big addons); the system's own download in the browser stops the same way |
+| `the system had not finished the backup after … s (cancelled)` | a large `/usr/local`: raise `--timeout` |
+| `the system was still finishing a cancelled backup` (HTTP 409) | a backup cancelled before is still running to its end on the system; the next run works |
+| `the prepared backup expired before its download` / `HTTP 410` | the finished backup waited more than 30 minutes, or someone cancelled it on the system's Backup page |
+| `curl 16` / `curl 18` / `curl 52` after about six minutes | a system before 1.0.0-beta.12 behind a proxy that cuts the wait short: update the system, or connect to it directly |
 | `… is not a readable backup archive` | the file is damaged; nothing older was deleted |
 
 The backups are written readable by their owner only (mode 0600): they hold the radio keys.
@@ -198,10 +213,14 @@ from the system's own download; it also restores on OpenCCU and a CCU3.
 
 ## Tests
 
-`sh tests/run.sh` runs the script against `tests/stub.py`, an HTTPS stand-in for the system's backup download (a
-token check, the file stream, 401, 403, 500, a truncated download, a broken archive, a tar that is no CCU backup, the encrypted variant, `--keep`,
-a config with several systems). It needs `python3`, `openssl`, `curl` and `tar`; `TEST_SH="busybox sh"` runs the
-script under busybox. CI runs it under dash, bash and busybox, on Ubuntu and Alpine, and shellcheck.
+`sh tests/run.sh` runs the script against `tests/stub.py`, an HTTPS stand-in for the system's backup API (a token
+check, the prepared backup with its polling, a busy system, a backup that fails, expires or never gets ready and is
+then cancelled, a cancel on `SIGTERM`, the plain download of an older system over HTTP/1.1, the file stream, 401,
+403, 500, a truncated download, a broken archive, a tar that is no CCU backup, the encrypted variant, `--keep`, a
+config with several systems). It needs `python3`, `openssl`, `curl`, `tar` and `timeout`; `TEST_SH="busybox sh"`
+runs the script under busybox. Every run of the script in it is ended after 60 seconds, and the suite stops when
+its temporary directory grows past 100 MB. CI runs it under dash, bash and busybox, on Ubuntu and Alpine, and
+shellcheck.
 
 ## Licence
 

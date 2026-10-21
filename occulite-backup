@@ -2,8 +2,9 @@
 # occulite-backup - download the backups of openccu-lite systems.
 #
 # One POSIX shell script, curl the only dependency: runs on a Linux server, a NAS (Synology, QNAP)
-# or a router with busybox. It fetches GET /api/system/v1/backup with a token that holds the
-# "backup" scope, checks the download, and keeps the newest N backups per system.
+# or a router with busybox. With a token that holds the "backup" scope it has the system prepare a
+# backup (POST /api/system/v1/backup/prepare, openccu-lite 1.0.0-beta.12 and later; the plain
+# GET /api/system/v1/backup before that), downloads and checks it, and keeps the newest N per system.
 #
 #   occulite-backup --host https://ccu.example --token-file /etc/occulite-backup/ccu.token \
 #                   --ca /etc/occulite-backup/ccu.pem --target /volume1/backup/ccu --keep 7
@@ -22,8 +23,8 @@ usage() {
 Usage: $PROG [options] --host URL (--token-file FILE | \$OCCULITE_TOKEN)
        $PROG --config FILE [options]
 
-Downloads the current backup of an openccu-lite system (GET /api/system/v1/backup) with a token
-that holds the "backup" scope, checks it, and keeps the newest N backups of that system.
+Has an openccu-lite system build a backup and downloads it with a token that holds the "backup"
+scope, checks it, and keeps the newest N backups of that system.
 
   --host URL          the system, https://name-or-address[:port]
   --token-file FILE   a file with the token (its first line); else \$OCCULITE_TOKEN
@@ -33,7 +34,9 @@ that holds the "backup" scope, checks it, and keeps the newest N backups of that
   --keep N            keep the newest N backups of the system there, delete older ones
                       after a checked new one (default: 0 = keep all)
   --name NAME         the system's name in the summary (default: the host)
-  --timeout SECONDS   for the whole download (default: 1800; the system builds the backup first)
+  --timeout SECONDS   for the system to build the backup, and again for its download
+                      (default: 1800)
+  --poll SECONDS      how often to ask whether the backup is ready (default: 5)
   --config FILE       several systems, one line each (see the README); the options above then
                       are the defaults for every line
   --version           print the version
@@ -47,7 +50,7 @@ say() { printf '%s\n' "$*"; }
 err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 
 # defaults, from the command line; a config line overrides them per system
-D_HOST=; D_TOKEN_FILE=; D_CA=; D_INSECURE=no; D_TARGET=.; D_KEEP=0; D_NAME=; D_TIMEOUT=1800
+D_HOST=; D_TOKEN_FILE=; D_CA=; D_INSECURE=no; D_TARGET=.; D_KEEP=0; D_NAME=; D_TIMEOUT=1800; D_POLL=5
 CONFIG=
 
 need_arg() { [ "$2" -ge 2 ] || { err "$1 needs a value"; exit 2; }; }
@@ -61,6 +64,7 @@ while [ $# -gt 0 ]; do
     --keep) need_arg "$1" $#; D_KEEP=$2; shift 2 ;;
     --name) need_arg "$1" $#; D_NAME=$2; shift 2 ;;
     --timeout) need_arg "$1" $#; D_TIMEOUT=$2; shift 2 ;;
+    --poll) need_arg "$1" $#; D_POLL=$2; shift 2 ;;
     --config) need_arg "$1" $#; CONFIG=$2; shift 2 ;;
     --version) say "$PROG $VERSION"; exit 0 ;;
     --help|-h) usage; exit 0 ;;
@@ -74,12 +78,45 @@ command -v curl >/dev/null 2>&1 || { err "curl is not installed"; exit 2; }
 is_count() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
 is_count "$D_KEEP" || { err "--keep is a number, not $D_KEEP"; exit 2; }
 is_count "$D_TIMEOUT" && [ "$D_TIMEOUT" -gt 0 ] || { err "--timeout is a number of seconds, not $D_TIMEOUT"; exit 2; }
+is_count "$D_POLL" && [ "$D_POLL" -gt 0 ] || { err "--poll is a number of seconds, not $D_POLL"; exit 2; }
 
 TMPD=$(mktemp -d 2>/dev/null) || { err "no temporary directory"; exit 1; }
 [ -d "$TMPD" ] || { err "no temporary directory"; exit 1; }
 cleanup() { rm -rf "${TMPD:?}"; }
 trap cleanup EXIT
-trap 'exit 1' HUP INT TERM
+# interrupted while the system builds a backup this run asked for: cancel it there
+trap 'cancel_job; exit 1' HUP INT TERM
+
+now() { date +%s; }
+
+# curl_sys <output file> <curl options...> <url>: curl with the token, the certificate and https
+# only; prints "<http code> <bytes>", returns curl's status
+curl_sys() {
+  o=$1
+  shift
+  set -- -sS -o "$o" -w '%{http_code} %{size_download}' -H "@$hdr" --connect-timeout 30 --proto '=https' --tlsv1.2 "$@"
+  if [ "$INSECURE" = yes ]; then
+    set -- -k "$@"
+  elif [ -n "$CA" ]; then
+    set -- --cacert "$CA" "$@"
+  fi
+  curl "$@" 2>"$TMPD/curl.err"
+}
+curl_err() { head -n 1 "$TMPD/curl.err" 2>/dev/null; }
+
+# json_field <file> <key>: a string value of the system's JSON answer (flat, as occulited writes it)
+json_field() {
+  tr -d '\n\r' <"$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+# cancel_job: DELETE the backup job this run started, so the system does not keep its file
+JOB=; JOB_OWN=; hdr=; base=
+cancel_job() {
+  if [ -n "$JOB" ] && [ "$JOB_OWN" = yes ] && [ -f "$hdr" ]; then
+    curl_sys "$TMPD/cancel" -X DELETE --max-time 20 "$base/backup/prepare/$JOB" >/dev/null
+  fi
+  JOB=
+}
 
 # the system's own name for its backup, from Content-Disposition: a plain file name ending in
 # .sbk or .sbk.age, nothing else (no path, no quotes, no control characters)
@@ -118,11 +155,21 @@ prune() {
 
 # fail <reason>: the partial download goes, one summary line
 fail() {
+  cancel_job
   rm -f "${part:?}"
   say "FAIL $label: $*"
 }
 
-# backup_one: one system with HOST TOKEN_FILE CA INSECURE TARGET KEEP NAME TIMEOUT set; prints the
+# http_fail <code>: an answer other than the one expected, explained
+http_fail() {
+  case "$1" in
+    401) fail "HTTP 401: the token is not accepted (wrong, expired or deleted)" ;;
+    403) fail "HTTP 403: the token lacks the backup scope, or is not allowed from this address" ;;
+    *) fail "HTTP $1 from the system" ;;
+  esac
+}
+
+# backup_one: one system with HOST TOKEN_FILE CA INSECURE TARGET KEEP NAME TIMEOUT POLL set; prints the
 # summary line, returns 0 or 1
 backup_one() {
   label=${NAME:-$HOST}
@@ -144,34 +191,101 @@ backup_one() {
   [ -w "$TARGET" ] || { say "FAIL $label: cannot write to $TARGET"; return 1; }
   is_count "$KEEP" || { say "FAIL $label: keep is a number, not $KEEP"; return 1; }
   is_count "$TIMEOUT" && [ "$TIMEOUT" -gt 0 ] || { say "FAIL $label: timeout is a number of seconds, not $TIMEOUT"; return 1; }
+  is_count "$POLL" && [ "$POLL" -gt 0 ] || { say "FAIL $label: poll is a number of seconds, not $POLL"; return 1; }
 
   # the token goes to curl in a file (-H @file), never on its command line
   hdr="$TMPD/auth"
   (umask 077 && printf 'Authorization: Bearer %s\n' "$token" >"$hdr")
   part="$TARGET/.occulite-backup.$$.part"
   heads="$TMPD/headers"
-  set -- -sS -o "$part" -D "$heads" -w '%{http_code} %{size_download}' -H "@$hdr" \
-    --connect-timeout 30 --max-time "$TIMEOUT" --proto '=https' --tlsv1.2
-  if [ "$INSECURE" = yes ]; then
-    set -- "$@" -k
-  elif [ -n "$CA" ]; then
-    [ -r "$CA" ] || { rm -f "${hdr:?}"; say "FAIL $label: cannot read the CA file $CA"; return 1; }
-    set -- "$@" --cacert "$CA"
+  base="$HOST/api/system/v1"
+  JOB=; JOB_OWN=
+  if [ "$INSECURE" != yes ] && [ -n "$CA" ] && [ ! -r "$CA" ]; then
+    rm -f "${hdr:?}"; say "FAIL $label: cannot read the CA file $CA"; return 1
   fi
-  out=$(curl "$@" "$HOST/api/system/v1/backup" 2>"$TMPD/curl.err")
-  rc=$?
-  rm -f "${hdr:?}"
+  deadline=$(($(now) + TIMEOUT))
+
+  # 1. the system builds the backup as a job of its own (openccu-lite 1.0.0-beta.12 and later):
+  # POST /backup/prepare, poll it, then fetch the finished file, which streams from the first byte.
+  # A system before that answers 404: then GET /backup alone, over HTTP/1.1 (its web server ends
+  # an HTTP/2 response that has written nothing for six minutes, while the backup is being made).
+  mode=prepared
+  while :; do
+    out=$(curl_sys "$TMPD/job" -X POST --max-time 60 "$base/backup/prepare")
+    rc=$?
+    code=${out%% *}
+    [ "$rc" = 0 ] || { fail "the system did not answer (curl $rc: $(curl_err))"; return 1; }
+    case "$code" in
+      200|202) break ;;
+      404|405) mode=plain; break ;;
+      409)
+        # backup-busy: a cancelled backup is still finishing on the system
+        [ "$(now)" -lt "$deadline" ] || { fail "the system was still finishing a cancelled backup after $TIMEOUT s (HTTP 409)"; return 1; }
+        sleep "$POLL" ;;
+      *) http_fail "$code"; return 1 ;;
+    esac
+  done
+
+  if [ "$mode" = prepared ]; then
+    JOB=$(json_field "$TMPD/job" id)
+    case "$JOB" in
+      ''|*[!0-9A-Za-z_-]*) JOB=; fail "the system answered the backup job without an id"; return 1 ;;
+    esac
+    # 202: this run started the job, so it cancels it when it gives up; 200 joined one that ran
+    [ "$code" = 202 ] && JOB_OWN=yes
+    errs=0
+    while :; do
+      if [ "$code" = 200 ] || [ "$code" = 202 ]; then
+        errs=0
+        state=$(json_field "$TMPD/job" state)
+        case "$state" in
+          ready) break ;;
+          running) ;;
+          failed)
+            why=$(json_field "$TMPD/job" error)
+            JOB=
+            case "$why" in
+              expired) fail "the prepared backup expired before its download (the system keeps it 30 minutes)" ;;
+              *) fail "the system could not make the backup (${why:-no reason given})" ;;
+            esac
+            return 1 ;;
+          downloaded) JOB=; fail "the prepared backup was downloaded by someone else meanwhile"; return 1 ;;
+          *) fail "the system answered the backup job with the state '$state'"; return 1 ;;
+        esac
+      else
+        case "$code" in
+          404) JOB=; fail "the system no longer knows the backup job (restarted?)"; return 1 ;;
+          401|403) http_fail "$code"; return 1 ;;
+        esac
+        # a network blip or a 5xx: try again a few times
+        errs=$((errs + 1))
+        [ "$errs" -lt 5 ] || { fail "asking for the backup job failed five times (HTTP $code, curl $rc)"; return 1; }
+      fi
+      [ "$(now)" -lt "$deadline" ] || { fail "the system had not finished the backup after $TIMEOUT s (cancelled)"; return 1; }
+      sleep "$POLL"
+      out=$(curl_sys "$TMPD/job" --max-time 60 "$base/backup/prepare/$JOB")
+      rc=$?
+      code=${out%% *}
+      [ "$rc" = 0 ] || code=000
+    done
+    out=$(curl_sys "$part" -D "$heads" --max-time "$TIMEOUT" "$base/backup?prepared=$JOB")
+    rc=$?
+  else
+    out=$(curl_sys "$part" -D "$heads" --http1.1 --max-time "$TIMEOUT" "$base/backup")
+    rc=$?
+  fi
   code=${out%% *}
   got=${out#* }
   if [ "$rc" != 0 ]; then
-    fail "the download failed (curl $rc: $(head -n 1 "$TMPD/curl.err"))"; return 1
+    fail "the download failed (curl $rc: $(curl_err))"; return 1
   fi
   case "$code" in
     200) ;;
-    401) fail "HTTP 401: the token is not accepted (wrong, expired or deleted)"; return 1 ;;
-    403) fail "HTTP 403: the token lacks the backup scope, or is not allowed from this address"; return 1 ;;
-    *) fail "HTTP $code from the system"; return 1 ;;
+    410) JOB=; fail "HTTP 410: the prepared backup is gone (expired after 30 minutes, cancelled or downloaded)"; return 1 ;;
+    *) http_fail "$code"; return 1 ;;
   esac
+  # handed out: nothing left to cancel on the system
+  JOB=
   [ -f "$part" ] || { fail "nothing was downloaded"; return 1; }
   size=$(wc -c <"$part" | tr -d ' ')
   [ "$size" -gt 0 ] || { fail "the download is empty"; return 1; }
@@ -204,7 +318,7 @@ backup_one() {
 
 set_defaults() {
   HOST=$D_HOST; TOKEN_FILE=$D_TOKEN_FILE; CA=$D_CA; INSECURE=$D_INSECURE; TARGET=$D_TARGET
-  KEEP=$D_KEEP; NAME=$D_NAME; TIMEOUT=$D_TIMEOUT
+  KEEP=$D_KEEP; NAME=$D_NAME; TIMEOUT=$D_TIMEOUT; POLL=$D_POLL
 }
 
 failed=0
@@ -234,6 +348,7 @@ if [ -n "$CONFIG" ]; then
         target=*) TARGET=$v ;;
         keep=*) KEEP=$v ;;
         timeout=*) TIMEOUT=$v ;;
+        poll=*) POLL=$v ;;
         *) bad=$kv ;;
       esac
     done

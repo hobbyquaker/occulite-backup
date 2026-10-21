@@ -6,8 +6,10 @@ Lädt die Sicherungen von [openccu-lite](https://github.com/hobbyquaker/openccu-
 POSIX-Shell-Skript, einzige Abhängigkeit `curl`. Es läuft auf einem Linux-Server, einem NAS (Synology, QNAP) und
 einem Router mit busybox, per cron oder systemd-Timer.
 
-- holt die aktuelle Sicherung (`GET /api/system/v1/backup`) mit einem API-Token, das nichts anderes darf als
-  Sicherungen;
+- lässt das System eine frische Sicherung erstellen und lädt sie herunter, mit einem API-Token, das nichts anderes
+  darf als Sicherungen: es startet die Sicherung (`POST /api/system/v1/backup/prepare`), wartet, bis sie fertig ist,
+  und holt dann die Datei (`GET /api/system/v1/backup?prepared=<id>`); ein System vor openccu-lite 1.0.0-beta.12
+  bekommt das einfache `GET /api/system/v1/backup` über HTTP/1.1;
 - **prüft den Download**, bevor etwas Älteres angefasst wird: HTTP 200, nicht leer, so lang wie vom System
   angekündigt und lesbar - eine `.sbk` muss sich als CCU-Archiv öffnen lassen (ein tar mit `usr_local.tar.gz` darin), eine verschlüsselte `.sbk.age` mit dem
   age-Kopf beginnen. Ein fehlgeschlagener Download wird gelöscht und der Lauf schlägt fehl;
@@ -85,7 +87,16 @@ ok   https://ccu.example: /srv/backup/ccu/ccu-3.89.11.20260919-2026-10-20-0300.s
 ```
 
 Statt `--token-file` geht auch die Umgebungsvariable `OCCULITE_TOKEN`. Das System erstellt die Sicherung erst auf
-Anfrage; auf einer kleinen Platine dauert das ein, zwei Minuten, deshalb ist `--timeout` standardmäßig 1800 Sekunden.
+Anfrage; auf einer kleinen Platine dauert das ein, zwei Minuten, mit einem großen `/usr/local` (große Addons) zehn
+Minuten und mehr, deshalb ist `--timeout` standardmäßig 1800 Sekunden - für das Erstellen und noch einmal für den
+Download. Das Skript fragt alle `--poll` Sekunden (5), ob sie fertig ist. Wird es angehalten, während das System die
+Sicherung erstellt (Strg-C, `SIGTERM`, der Timeout), bricht es diese Sicherung auf dem System ab, damit ihre Datei
+dort nicht liegen bleibt.
+
+**Für große Sicherungen wird openccu-lite 1.0.0-beta.12 oder neuer empfohlen.** Ab dieser Version erstellt das
+System die Sicherung zuerst und gibt sie heraus, wenn sie vollständig ist. Ein älteres System erstellt sie, während
+der Download wartet; das Skript nimmt dann HTTP/1.1, das für jede Größe funktioniert, solange nichts zwischen den
+beiden Rechnern (ein Reverse-Proxy) das lange Warten abbricht.
 
 | Option | |
 | --- | --- |
@@ -96,7 +107,8 @@ Anfrage; auf einer kleinen Platine dauert das ein, zwei Minuten, deshalb ist `--
 | `--target ORDNER` | wohin die Sicherungen kommen (Standard: das aktuelle Verzeichnis) |
 | `--keep N` | die neuesten N Sicherungen dieses Systems dort behalten (Standard 0: alle) |
 | `--name NAME` | der Name des Systems in der Zusammenfassung |
-| `--timeout SEKUNDEN` | für den ganzen Download (Standard 1800) |
+| `--timeout SEKUNDEN` | für das Erstellen der Sicherung und noch einmal für ihren Download (Standard 1800) |
+| `--poll SEKUNDEN` | wie oft gefragt wird, ob die Sicherung fertig ist (Standard 5) |
 | `--config DATEI` | mehrere Systeme, siehe unten |
 
 `--keep` zählt nur die Dateien **dieses Systems**, am Hostnamen am Anfang der Dateinamen des Systems
@@ -107,7 +119,7 @@ und alle anderen Dateien bleiben unberührt. Schlägt der neue Download fehl, wi
 
 Eine Zeile je System, Einstellungen als `schlüssel=wert` durch Leerzeichen getrennt (keine Leerzeichen in einem
 Wert); `#` beginnt einen Kommentar. Einstellungen: `name`, `host`, `token_file`, `ca`, `insecure` (`yes`),
-`target`, `keep`, `timeout`. Optionen auf der Befehlszeile gelten als Vorgabe für jede Zeile.
+`target`, `keep`, `timeout`, `poll`. Optionen auf der Befehlszeile gelten als Vorgabe für jede Zeile.
 
 ```
 # /etc/occulite-backup/systems.conf
@@ -192,7 +204,10 @@ journalctl -u occulite-backup.service     # die letzten Läufe
 | `HTTP 401: the token is not accepted` | ein falsches, abgelaufenes oder gelöschtes Token - oder eines, das von der Adresse der Anfrage nicht erlaubt ist (IPv6, siehe Schritt 1) |
 | `HTTP 403` | dem Token fehlt die Berechtigung *Sicherungen* |
 | `curl 60 … self-signed certificate` | `--ca` fehlt oder nennt ein anderes Zertifikat (Schritt 2) |
-| `curl 16` / `curl 18` / `curl 52` nach etwa sechs Minuten | das System brauchte zum Erstellen der Sicherung länger, als sein Webserver wartet (ein großes `/usr/local`, große Addons); der Download im Browser bricht dort genauso ab |
+| `the system had not finished the backup after … s (cancelled)` | ein großes `/usr/local`: `--timeout` erhöhen |
+| `the system was still finishing a cancelled backup` (HTTP 409) | eine vorher abgebrochene Sicherung läuft auf dem System noch zu Ende; der nächste Lauf klappt |
+| `the prepared backup expired before its download` / `HTTP 410` | die fertige Sicherung hat länger als 30 Minuten gewartet, oder jemand hat sie auf der Sicherungsseite des Systems abgebrochen |
+| `curl 16` / `curl 18` / `curl 52` nach etwa sechs Minuten | ein System vor 1.0.0-beta.12 hinter einem Proxy, der das Warten abbricht: das System aktualisieren oder direkt verbinden |
 | `… is not a readable backup archive` | die Datei ist beschädigt; nichts Älteres wurde gelöscht |
 
 Die Sicherungen werden nur für ihren Besitzer lesbar geschrieben (Modus 0600): Sie enthalten die Funkschlüssel.
@@ -205,11 +220,14 @@ CCU3 einspielen.
 
 ## Tests
 
-`sh tests/run.sh` lässt das Skript gegen `tests/stub.py` laufen, einen HTTPS-Ersatz für den Sicherungs-Download des
-Systems (Token-Prüfung, Datei-Stream, 401, 403, 500, abgebrochener Download, kaputtes Archiv, ein tar ohne CCU-Sicherung, die verschlüsselte
-Variante, `--keep`, eine Konfiguration mit mehreren Systemen). Nötig sind `python3`, `openssl`, `curl` und `tar`;
-`TEST_SH="busybox sh"` führt das Skript unter busybox aus. Die CI lässt es unter dash, bash und busybox laufen, auf
-Ubuntu und Alpine, dazu shellcheck.
+`sh tests/run.sh` lässt das Skript gegen `tests/stub.py` laufen, einen HTTPS-Ersatz für die Sicherungs-API des
+Systems (Token-Prüfung, die vorbereitete Sicherung mit ihrem Abfragen, ein beschäftigtes System, eine Sicherung, die
+fehlschlägt, verfällt oder nie fertig wird und dann abgebrochen wird, der Abbruch bei `SIGTERM`, der einfache Download
+eines älteren Systems über HTTP/1.1, Datei-Stream, 401, 403, 500, abgebrochener Download, kaputtes Archiv, ein tar
+ohne CCU-Sicherung, die verschlüsselte Variante, `--keep`, eine Konfiguration mit mehreren Systemen). Nötig sind
+`python3`, `openssl`, `curl`, `tar` und `timeout`; `TEST_SH="busybox sh"` führt das Skript unter busybox aus. Jeder
+Lauf des Skripts darin wird nach 60 Sekunden beendet, und die Tests brechen ab, wenn ihr temporäres Verzeichnis
+über 100 MB wächst. Die CI lässt es unter dash, bash und busybox laufen, auf Ubuntu und Alpine, dazu shellcheck.
 
 ## Lizenz
 
