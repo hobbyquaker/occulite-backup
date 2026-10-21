@@ -76,9 +76,10 @@ done
 command -v curl >/dev/null 2>&1 || { err "curl is not installed"; exit 2; }
 
 is_count() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
+is_secs() { is_count "$1" && [ "$1" -gt 0 ]; }
 is_count "$D_KEEP" || { err "--keep is a number, not $D_KEEP"; exit 2; }
-is_count "$D_TIMEOUT" && [ "$D_TIMEOUT" -gt 0 ] || { err "--timeout is a number of seconds, not $D_TIMEOUT"; exit 2; }
-is_count "$D_POLL" && [ "$D_POLL" -gt 0 ] || { err "--poll is a number of seconds, not $D_POLL"; exit 2; }
+is_secs "$D_TIMEOUT" || { err "--timeout is a number of seconds, not $D_TIMEOUT"; exit 2; }
+is_secs "$D_POLL" || { err "--poll is a number of seconds, not $D_POLL"; exit 2; }
 
 TMPD=$(mktemp -d 2>/dev/null) || { err "no temporary directory"; exit 1; }
 [ -d "$TMPD" ] || { err "no temporary directory"; exit 1; }
@@ -190,8 +191,8 @@ backup_one() {
   [ -d "$TARGET" ] || { say "FAIL $label: the target $TARGET is not a directory"; return 1; }
   [ -w "$TARGET" ] || { say "FAIL $label: cannot write to $TARGET"; return 1; }
   is_count "$KEEP" || { say "FAIL $label: keep is a number, not $KEEP"; return 1; }
-  is_count "$TIMEOUT" && [ "$TIMEOUT" -gt 0 ] || { say "FAIL $label: timeout is a number of seconds, not $TIMEOUT"; return 1; }
-  is_count "$POLL" && [ "$POLL" -gt 0 ] || { say "FAIL $label: poll is a number of seconds, not $POLL"; return 1; }
+  is_secs "$TIMEOUT" || { say "FAIL $label: timeout is a number of seconds, not $TIMEOUT"; return 1; }
+  is_secs "$POLL" || { say "FAIL $label: poll is a number of seconds, not $POLL"; return 1; }
 
   # the token goes to curl in a file (-H @file), never on its command line
   hdr="$TMPD/auth"
