@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck disable=SC2015,SC2012,SC2086 # ok() never fails; ls only lists what the test made; $TEST_SH is "busybox sh" and the like
 # The tests of occulite-backup: the script against tests/stub.py, an HTTPS stand-in for
-# openccu-lite's backup API (the prepared backup and the plain GET /backup) with a self-signed
+# openccu-lite's backup API (the prepared backup and the plain GET /backup) and client pairing, with a self-signed
 # certificate made here.
 #
 #   sh tests/run.sh                      the script under sh
@@ -184,7 +184,7 @@ out=$(sut --host "$URL" --poll 0 2>&1); rc=$?
 [ "$rc" = 2 ] && ok "--poll 0: a usage error" || bad "--poll 0: rc $rc"
 out=$(sut 2>&1); rc=$?
 [ "$rc" = 2 ] && echo "$out" | grep -q '^Usage:' && ok "no host: the usage, exit 2" || bad "no host: rc $rc"
-out=$(sut --version); [ "$out" = "occulite-backup 1.0.0" ] && ok "--version" || bad "--version: $out"
+out=$(sut --version); [ "$out" = "occulite-backup 1.1.0" ] && ok "--version" || bad "--version: $out"
 fresh
 : >"$T/empty"
 out=$(sut --host "$URL" --token-file "$T/empty" --ca "$T/cert.pem" --target "$T/target" 2>&1); rc=$?
@@ -265,5 +265,115 @@ PATH="$T/bin:$PATH" timeout "$CASE_TIMEOUT" $TEST_SH "$SCRIPT" --host "$URL" --t
 printf 'legacy.ccu-a\n' >"$T/token"
 PATH="$T/bin:$PATH" timeout "$CASE_TIMEOUT" $TEST_SH "$SCRIPT" --host "$URL" --token-file "$T/token" --ca "$T/cert.pem" --target "$T/target" >/dev/null 2>&1
 grep -- '--http1.1' "$T/argv" | grep -q '/api/system/v1/backup$' && ok "the plain GET /backup goes over HTTP/1.1" || bad "http1.1: $(cat "$T/argv")"
+
+# --- pair: the code against occulited's implementation (pairing.Code in Go), and with a leading zero
+for v in "000102030405060708090a0b0c0d0e0f 101112131415161718191a1b1c1d1e1f - 848873" \
+         "00ff0a0d25275c22 000a255c0d0a00ff00112233445566 a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90 204296" \
+         "00000000000000000000000000000000 0000000000000000000000000000062b - 000487"; do
+  set -- $v
+  fpv=$3; [ "$fpv" = - ] && fpv=
+  got=$(sut _pair-code "$1" "$2" "$fpv")
+  [ "$got" = "$4" ] && ok "the code of $1: $4, as occulited computes it" || bad "code of $1: $got, not $4"
+done
+
+# pair_run <instance> [options...]: pair against the stub; output in $out, status in $rc
+pair_run() {
+  pi=$1
+  shift
+  : >"$EV"
+  rm -f "$T/paired.token"
+  out=$(sut pair --host "$URL" --token-file "$T/paired.token" --ca "$T/cert.pem" --instance "$pi" "$@" 2>&1)
+  rc=$?
+}
+pcode() { sed -n 's/^PAIRCODE //p' "$EV" | head -n 1; }
+
+# --- approved: the code on the screen is the system's, the token is saved 0600, and it works
+pair_run approve
+want=$(pcode)
+mode=$(ls -l "$T/paired.token" 2>/dev/null | cut -c1-10)
+[ "$rc" = 0 ] && [ -n "$want" ] && echo "$out" | grep -q "Code: $want\$" && [ "$(cat "$T/paired.token")" = good.paired-host ] && [ "$mode" = "-rw-------" ] \
+  && ok "pair: the code is the system's, the token saved with mode 0600" || bad "pair: rc $rc, code $want, mode $mode, $out"
+echo "$out" | grep -q "occulite-backup --host $URL --token-file $T/paired.token --ca $T/cert.pem --target DIR" && echo "$out" | grep -q '127.0.0.1/32' \
+  && echo "$out" | grep -q 'occulite-backup-approve' && ! echo "$out" | grep -q 'good.paired-host' \
+  && ok "pair: names the token, its address and the next command, never the secret" || bad "pair output: $out"
+grep -q "^POST /api/auth/v1/pairing/request approve application/json" "$EV" && [ "$(grep -c '^GET ' "$EV")" = 2 ] && [ "$(events '^DELETE')" = 0 ] \
+  && ok "pair: POST, two polls, nothing withdrawn" || bad "pair events: $(cat "$EV")"
+fresh
+out=$(sut --host "$URL" --token-file "$T/paired.token" --ca "$T/cert.pem" --poll 1 --target "$T/target" 2>&1); rc=$?
+[ "$rc" = 0 ] && [ "$(count)" = 1 ] && ok "pair: the token it saved downloads a backup" || bad "paired backup: rc $rc, $out"
+no_pair_tmp() { [ -z "$(find "$T" -maxdepth 1 -name 'paired.token.tmp*')" ]; }
+no_pair_tmp && ok "pair: no temporary file left" || bad "pair left its temporary file"
+
+# --- an existing token file: refused before anything is asked, --force replaces it
+printf 'old-token\n' >"$T/paired.token"
+: >"$EV"
+out=$(sut pair --host "$URL" --token-file "$T/paired.token" --ca "$T/cert.pem" --instance now 2>&1); rc=$?
+[ "$rc" = 1 ] && [ "$(cat "$T/paired.token")" = old-token ] && [ ! -s "$EV" ] && echo "$out" | grep -q -- '--force' \
+  && ok "pair: an existing token file is refused, the system not asked" || bad "no force: rc $rc, $out, $(cat "$EV")"
+chmod 644 "$T/paired.token"
+out=$(sut pair --host "$URL" --token-file "$T/paired.token" --ca "$T/cert.pem" --instance now --force 2>&1); rc=$?
+mode=$(ls -l "$T/paired.token" | cut -c1-10)
+[ "$rc" = 0 ] && [ "$(cat "$T/paired.token")" = good.paired-host ] && [ "$mode" = "-rw-------" ] && ok "pair --force: replaced, mode 0600" || bad "force: rc $rc, $mode, $out"
+
+# --- what the system can answer
+for c in "reject|rejected on the system" "expire|expired before anyone" "gone|no longer knows the request" "off|Allow programs to ask for access" \
+         "notlocal|local networks only" "limit|ten an hour" "old|1.1.0-beta.1 or later" "none|no client pairing" "badtoken|no usable token" \
+         "proxy|another certificate"; do
+  pi=${c%%|*}; want=${c#*|}
+  pair_run "$pi"
+  [ "$rc" = 1 ] && [ ! -e "$T/paired.token" ] && echo "$out" | grep -qF "$want" && no_pair_tmp \
+    && ok "pair, $pi: exit 1, no token, says '$want'" || bad "pair $pi: rc $rc, $out"
+done
+[ "$(events '^DELETE')" = 1 ] && ok "pair, another certificate: the request is withdrawn" || bad "proxy withdraw: $(cat "$EV")"
+for pi in slowdown blip; do
+  pair_run "$pi"
+  [ "$rc" = 0 ] && [ -s "$T/paired.token" ] && ok "pair, $pi: asked again, token saved" || bad "pair $pi: rc $rc, $out"
+done
+
+# --- stopped while waiting: the request is withdrawn
+: >"$EV"
+rm -f "$T/paired.token"
+$TEST_SH "$SCRIPT" pair --host "$URL" --token-file "$T/paired.token" --ca "$T/cert.pem" --instance wait >"$T/sig.out" 2>&1 &
+pid=$!
+i=0
+while [ "$(events '^GET ')" = 0 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+kill -TERM "$pid" 2>/dev/null
+wait "$pid"; rc=$?
+[ "$rc" != 0 ] && [ "$(events '^DELETE /api/auth/v1/pairing/request/{id} wait')" = 1 ] && [ ! -e "$T/paired.token" ] \
+  && ok "pair, SIGTERM while waiting: withdrawn, no token" || bad "pair signal: rc $rc, $(cat "$T/sig.out"), $(cat "$EV")"
+
+# --- the certificate: refused without --ca, --insecure asks and pins what it saw
+: >"$EV"
+rm -f "$T/paired.token"
+out=$(sut pair --host "$URL" --token-file "$T/paired.token" --instance now 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$out" | grep -q -- '--ca' && [ ! -e "$T/paired.token" ] && ok "pair: a self-signed certificate without --ca is refused" || bad "pair no ca: rc $rc, $out"
+: >"$T/argv"
+PATH="$T/bin:$PATH" timeout "$CASE_TIMEOUT" $TEST_SH "$SCRIPT" pair --host "$URL" --token-file "$T/paired.token" --insecure --instance approve >"$T/ins.out" 2>&1; rc=$?
+[ "$rc" = 0 ] && [ -s "$T/paired.token" ] && ok "pair --insecure: works" || bad "pair insecure: rc $rc, $(cat "$T/ins.out")"
+grep 'client_nonce' "$T/argv" | grep -q -- '--pinnedpubkey sha256//' && ! grep '/pairing/request$' "$T/argv" | grep -q 'pinnedpubkey' \
+  && ok "pair: the polls are pinned to the certificate read with openssl" || bad "pin: $(cat "$T/argv")"
+! grep -q 'poll-0' "$T/argv" && ! grep -q 'good.paired' "$T/argv" && ok "pair: neither the poll secret nor the token on curl's command line" || bad "pair argv: $(cat "$T/argv")"
+
+# --- refused before anything is sent
+rm -f "$T/paired.token"
+out=$(sut pair --host "http://127.0.0.1:1" --token-file "$T/paired.token" 2>&1); rc=$?
+[ "$rc" = 2 ] && echo "$out" | grep -q "not https://" && ok "pair: http:// is refused" || bad "pair http: rc $rc, $out"
+out=$(sut pair --host "$URL" 2>&1); rc=$?
+[ "$rc" = 2 ] && echo "$out" | grep -q 'needs --host and --token-file' && ok "pair without --token-file: a usage error" || bad "pair no file: rc $rc, $out"
+out=$(sut pair --host "$URL" --token-file "$T/paired.token" --keep 3 2>&1); rc=$?
+[ "$rc" = 2 ] && echo "$out" | grep -q 'not an option of pair' && ok "pair --keep: a usage error" || bad "pair keep: rc $rc, $out"
+out=$(sut --host "$URL" --force 2>&1); rc=$?
+[ "$rc" = 2 ] && echo "$out" | grep -q 'belongs to pair' && ok "--force without pair: a usage error" || bad "force: rc $rc, $out"
+out=$(sut pair --host "$URL" --token-file "$T/paired.token" --instance 'a b' 2>&1); rc=$?
+[ "$rc" = 2 ] && ok "pair --instance with a blank: a usage error" || bad "instance: rc $rc, $out"
+out=$(sut pair --host "$URL" --token-file "$T/nodir/x" --ca "$T/cert.pem" --instance now 2>&1); rc=$?
+[ "$rc" = 1 ] && echo "$out" | grep -q 'cannot write beside' && ok "pair: a token file it cannot write is refused first" || bad "nodir: rc $rc, $out"
+# without openssl: a clear message. The shell by its full path, curl the only tool on PATH
+mkdir -p "$T/noopenssl"
+ln -s "$REAL_CURL" "$T/noopenssl/curl"
+set -- $TEST_SH
+sh0=$(command -v "$1"); shift
+out=$(PATH="$T/noopenssl" "$sh0" "$@" "$SCRIPT" pair --host "$URL" --token-file "$T/paired.token" 2>&1); rc=$?
+[ "$rc" = 2 ] && echo "$out" | grep -q 'pair needs openssl' && ok "pair without openssl: says so, exit 2" || bad "no openssl: rc $rc, $out"
 
 if [ "$fails" = 0 ]; then echo "occulite-backup tests ($TEST_SH): all passed"; else echo "occulite-backup tests ($TEST_SH): $fails failed"; exit 1; fi

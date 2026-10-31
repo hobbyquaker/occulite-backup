@@ -3,7 +3,7 @@
 [English](README.md)
 
 Lädt die Sicherungen von [openccu-lite](https://github.com/hobbyquaker/openccu-lite)-Systemen herunter: ein
-POSIX-Shell-Skript, einzige Abhängigkeit `curl`. Es läuft auf einem Linux-Server, einem NAS (Synology, QNAP) und
+POSIX-Shell-Skript, einzige Abhängigkeit für die Sicherungen ist `curl` (für `pair`, den Schritt zum Token, auch `openssl`). Es läuft auf einem Linux-Server, einem NAS (Synology, QNAP) und
 einem Router mit busybox, per cron oder systemd-Timer.
 
 - lässt das System eine frische Sicherung erstellen und lädt sie herunter, mit einem API-Token, das nichts anderes
@@ -30,11 +30,42 @@ sha256sum -c occulite-backup.sha256
 install -m 0755 occulite-backup /usr/local/bin/occulite-backup
 ```
 
-Nötig sind `curl` ab 7.55 (2017), `tar` und eine POSIX-Shell (`sh`, `dash`, `bash`, busybox `ash`).
+Nötig sind `curl` ab 7.55 (2017), `tar` und eine POSIX-Shell (`sh`, `dash`, `bash`, busybox `ash`). `occulite-backup pair`
+braucht außerdem `openssl`; die Sicherungen selbst nicht.
 
 ## 1. Ein Token, das nur Sicherungen darf
 
-Auf dem openccu-lite-System, als Administrator:
+**Das Koppeln braucht openccu-lite 1.1.0-beta.1 oder neuer;** auf einem älteren System das Token von Hand anlegen, siehe unten.
+
+Auf dem Rechner ausführen, der später die Sicherungen macht. Ein System mit selbstsigniertem Zertifikat braucht zuerst Schritt 2.
+
+```sh
+install -d -m 0700 /etc/occulite-backup
+occulite-backup pair --host https://ccu.example --token-file /etc/occulite-backup/ccu.token \
+  --ca /etc/occulite-backup/ccu.pem
+```
+
+Das Skript zeigt einen sechsstelligen Code und wartet bis zu fünf Minuten. Auf der **Status**-Seite des Systems, als
+Administrator, den Code sowie Namen und Adresse des Rechners mit der Anfrage vergleichen und sie dann mit dem Code und
+Passwort oder Passkey genehmigen. Das Skript speichert das Token mit Modus 0600 und nennt den nächsten Befehl. Eine
+vorhandene Token-Datei überschreibt es nur mit `--force`; `--instance NAME` setzt den Namen, den die Status-Seite zeigt
+(Standard: der Hostname).
+
+Das Token darf Sicherungen und sonst nichts, und es gilt nur von der Adresse, die gefragt hat: eine IPv4-Adresse genau, eine
+IPv6-Adresse mit ihrem /64. Löst der Name des Systems auch zu IPv6 auf, muss der nächtliche Lauf dieselbe Adressfamilie
+nehmen wie `pair`: `--host` in beiden Fällen denselben Namen oder dieselbe Adresse geben.
+
+**Ein Token ist so heikel wie eine Sicherung.** Eine Sicherung enthält die Funkschlüssel des Systems, und dieses Token kann
+sie holen, auch unverschlüsselt (`?encrypted=false`). Unter **System → Fernzugriff → API-Tokens** widerrufen, wenn der Rechner
+wegfällt.
+
+`pair` braucht `openssl`, für den Fingerabdruck des Zertifikats und den Code. Das System nimmt solche Anfragen nur aus seinen
+lokalen Netzen an (Firewall: *local networks*) und nur, solange **Programme dürfen um Zugriff bitten** im Bereich API-Tokens
+eingeschaltet ist.
+
+### Von Hand
+
+Auf jedem openccu-lite-System, als Administrator:
 
 1. **System → Fernzugriff → API-Tokens → Neues Token**.
 2. Name: z. B. `nas-sicherung`.
@@ -202,6 +233,11 @@ journalctl -u occulite-backup.service     # die letzten Läufe
 | Meldung | |
 | --- | --- |
 | `HTTP 401: the token is not accepted` | ein falsches, abgelaufenes oder gelöschtes Token - oder eines, das von der Adresse der Anfrage nicht erlaubt ist (IPv6, siehe Schritt 1) |
+| `the system does not take pairing requests` | `pair`: **Programme dürfen um Zugriff bitten** ist aus (System → Fernzugriff → API-Tokens) |
+| `the system takes pairing requests from its local networks only` | `pair`: die Adresse dieses Rechners liegt außerhalb der *local networks* der Firewall; aus einem davon koppeln oder das Token von Hand anlegen |
+| `the system refuses for now` (HTTP 429) | `pair`: eine Anfrage zugleich, zehn pro Stunde, und zehn Minuten Ruhe nach einer Ablehnung oder einem falschen Code |
+| `the system does not offer backups through pairing` | `pair`: das System ist älter als openccu-lite 1.1.0-beta.1 |
+| `another certificate than the one the system says it serves` | `pair`: ein Proxy vor dem System oder jemand dazwischen; direkt verbinden |
 | `HTTP 403` | dem Token fehlt die Berechtigung *Sicherungen* |
 | `curl 60 … self-signed certificate` | `--ca` fehlt oder nennt ein anderes Zertifikat (Schritt 2) |
 | `the system had not finished the backup after … s (cancelled)` | ein großes `/usr/local`: `--timeout` erhöhen |
@@ -222,7 +258,8 @@ CCU3 einspielen.
 
 `sh tests/run.sh` lässt das Skript gegen `tests/stub.py` laufen, einen HTTPS-Ersatz für die Sicherungs-API des
 Systems (Token-Prüfung, die vorbereitete Sicherung mit ihrem Abfragen, ein beschäftigtes System, eine Sicherung, die
-fehlschlägt, verfällt oder nie fertig wird und dann abgebrochen wird, der Abbruch bei `SIGTERM`, der einfache Download
+fehlschlägt, verfällt oder nie fertig wird und dann abgebrochen wird, der Abbruch bei `SIGTERM`, das Koppeln mit dem Code gegen feste Vektoren aus der Implementierung des Systems und jeder
+Ablehnung, der einfache Download
 eines älteren Systems über HTTP/1.1, Datei-Stream, 401, 403, 500, abgebrochener Download, kaputtes Archiv, ein tar
 ohne CCU-Sicherung, die verschlüsselte Variante, `--keep`, eine Konfiguration mit mehreren Systemen). Nötig sind
 `python3`, `openssl`, `curl`, `tar` und `timeout`; `TEST_SH="busybox sh"` führt das Skript unter busybox aus. Jeder

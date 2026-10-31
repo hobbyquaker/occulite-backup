@@ -1,27 +1,30 @@
 #!/bin/sh
 # occulite-backup - download the backups of openccu-lite systems.
 #
-# One POSIX shell script, curl the only dependency: runs on a Linux server, a NAS (Synology, QNAP)
-# or a router with busybox. With a token that holds the "backup" scope it has the system prepare a
+# One POSIX shell script, curl the only dependency for the backups (the pair subcommand needs openssl
+# as well): runs on a Linux server, a NAS (Synology, QNAP) or a router with busybox. With a token that holds the "backup" scope it has the system prepare a
 # backup (POST /api/system/v1/backup/prepare, openccu-lite 1.0.0-beta.12 and later; the plain
 # GET /api/system/v1/backup before that), downloads and checks it, and keeps the newest N per system.
 #
 #   occulite-backup --host https://ccu.example --token-file /etc/occulite-backup/ccu.token \
 #                   --ca /etc/occulite-backup/ccu.pem --target /volume1/backup/ccu --keep 7
 #   occulite-backup --config /etc/occulite-backup/systems.conf
+#   occulite-backup pair --host https://ccu.example --token-file /etc/occulite-backup/ccu.token \
+#                   --ca /etc/occulite-backup/ccu.pem
 #
 # See README.md (English) and README.de.md (German). MIT licence.
 set -u
 # a backup holds the system's radio keys: what this script writes is the user's alone
 umask 077
 
-VERSION=1.0.0
+VERSION=1.1.0
 PROG=occulite-backup
 
 usage() {
   cat <<USAGE
 Usage: $PROG [options] --host URL (--token-file FILE | \$OCCULITE_TOKEN)
        $PROG --config FILE [options]
+       $PROG pair --host URL --token-file FILE [--ca FILE | --insecure] [--instance NAME] [--force]
 
 Has an openccu-lite system build a backup and downloads it with a token that holds the "backup"
 scope, checks it, and keeps the newest N backups of that system.
@@ -42,20 +45,77 @@ scope, checks it, and keeps the newest N backups of that system.
   --version           print the version
   --help              this text
 
-Exit status: 0 when every backup was downloaded and checked, 1 when one failed, 2 for a usage error.
+pair asks the system for such a token (openccu-lite 1.1.0-beta.1 or later, needs openssl): it shows a
+six-digit code, an administrator approves the request on the system's Status page with that code and
+a password or passkey, and the token lands in --token-file (mode 0600). Run it on the machine that
+will run the backups: the token works from this address only.
+
+  --token-file FILE   where the token goes
+  --instance NAME     this machine's name on the Status page and in the token's name
+                      (default: its host name)
+  --force             replace a token file that exists
+
+Exit status: 0 when every backup was downloaded and checked (pair: the token was saved), 1 when one
+failed (pair: no token), 2 for a usage error.
 USAGE
 }
 
 say() { printf '%s\n' "$*"; }
 err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 
+# hex_bytes <hex>: the raw bytes (NUL included, so never in a variable)
+hex_bytes() {
+  hb=$1
+  while [ -n "$hb" ]; do
+    # shellcheck disable=SC2059 # the format is the byte's octal escape
+    printf "\\$(printf %o "0x${hb%"${hb#??}"}")"
+    hb=${hb#??}
+  done
+}
+# sha256_hex: the digest of stdin in lower-case hex, whatever else this openssl prints around it
+sha256_hex() { openssl dgst -sha256 | awk '{print $NF}'; }
+# pair_code <nonce> <client nonce> <fingerprint>, all hex: the six digits the Status page shows, the
+# first four bytes of SHA-256(nonce || client nonce || fingerprint) as a big-endian integer modulo
+# 1000000 (byte by byte, so a shell with 32-bit arithmetic gets there too)
+pair_code() {
+  d=$({ hex_bytes "$1"; hex_bytes "$2"; hex_bytes "$3"; } | sha256_hex)
+  r=0
+  while [ "${#d}" -gt 56 ]; do
+    r=$(((r * 256 + 0x${d%"${d#??}"}) % 1000000))
+    d=${d#??}
+  done
+  printf '%06d\n' "$r"
+}
+# the code alone, for the tests' fixed vectors
+if [ "${1:-}" = _pair-code ]; then
+  pair_code "$2" "$3" "${4:-}"
+  exit $?
+fi
+
 # defaults, from the command line; a config line overrides them per system
 D_HOST=; D_TOKEN_FILE=; D_CA=; D_INSECURE=no; D_TARGET=.; D_KEEP=0; D_NAME=; D_TIMEOUT=1800; D_POLL=5
 CONFIG=
+MODE=backup; D_INSTANCE=; D_FORCE=no
 
+if [ "${1:-}" = pair ]; then
+  MODE=pair
+  shift
+fi
 need_arg() { [ "$2" -ge 2 ] || { err "$1 needs a value"; exit 2; }; }
 while [ $# -gt 0 ]; do
+  if [ "$MODE" = pair ]; then
+    case "$1" in
+      --host|--token-file|--ca|--insecure|--instance|--force|--version|--help|-h) ;;
+      *) err "$1 is not an option of pair"; usage >&2; exit 2 ;;
+    esac
+  else
+    case "$1" in
+      --instance|--force) err "$1 belongs to pair"; usage >&2; exit 2 ;;
+    esac
+  fi
   case "$1" in
+    --instance) need_arg "$1" $#; D_INSTANCE=$2; shift 2 ;;
+    --force) D_FORCE=yes; shift ;;
     --host) need_arg "$1" $#; D_HOST=$2; shift 2 ;;
     --token-file) need_arg "$1" $#; D_TOKEN_FILE=$2; shift 2 ;;
     --ca) need_arg "$1" $#; D_CA=$2; shift 2 ;;
@@ -74,6 +134,9 @@ while [ $# -gt 0 ]; do
 done
 
 command -v curl >/dev/null 2>&1 || { err "curl is not installed"; exit 2; }
+if [ "$MODE" = pair ]; then
+  command -v openssl >/dev/null 2>&1 || { err "pair needs openssl for the certificate's fingerprint and the code, and it is not installed: install it, or make the token by hand on the system (see the README)"; exit 2; }
+fi
 
 is_count() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
 is_secs() { is_count "$1" && [ "$1" -gt 0 ]; }
@@ -83,19 +146,25 @@ is_secs "$D_POLL" || { err "--poll is a number of seconds, not $D_POLL"; exit 2;
 
 TMPD=$(mktemp -d 2>/dev/null) || { err "no temporary directory"; exit 1; }
 [ -d "$TMPD" ] || { err "no temporary directory"; exit 1; }
-cleanup() { rm -rf "${TMPD:?}"; }
+PAIR_TMP=
+cleanup() {
+  rm -rf "${TMPD:?}"
+  [ -z "$PAIR_TMP" ] || rm -f "$PAIR_TMP"
+}
 trap cleanup EXIT
 # interrupted while the system builds a backup this run asked for: cancel it there
 trap 'cancel_job; exit 1' HUP INT TERM
 
 now() { date +%s; }
 
+PIN=
 # curl_sys <output file> <curl options...> <url>: curl with the token, the certificate and https
 # only; prints "<http code> <bytes>", returns curl's status
 curl_sys() {
   o=$1
   shift
   set -- -sS -o "$o" -w '%{http_code} %{size_download}' -H "@$hdr" --connect-timeout 30 --proto '=https' --tlsv1.2 "$@"
+  [ -z "$PIN" ] || set -- --pinnedpubkey "sha256//$PIN" "$@"
   if [ "$INSECURE" = yes ]; then
     set -- -k "$@"
   elif [ -n "$CA" ]; then
@@ -317,10 +386,197 @@ backup_one() {
   return 0
 }
 
+# json_list <file> <key>: the strings of a flat JSON list, comma-separated
+json_list() {
+  tr -d '\n\r' <"$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | tr -d '" '
+}
+
+# pair_refused <http code> <answer file>: why the system would not take the request
+pair_refused() {
+  e=$(json_field "$2" error)
+  case "$1:$e" in
+    403:pairing-off) err "the system does not take pairing requests: an administrator can allow them under System > Remote access > API tokens (Allow programs to ask for access). Or make the token by hand there (see the README)." ;;
+    403:not-local) err "the system takes pairing requests from its local networks only, and this machine's address is not among them (firewall: local networks). Run pair from one, or make the token by hand on the system (see the README)." ;;
+    429:*) err "the system refuses for now: $(json_field "$2" message). One request per program and address at a time, ten an hour, and ten minutes of silence after a rejection or a wrong code; try again later (it asks to wait $(header_value "$TMPD/pair.head" retry-after) s)." ;;
+    404:*|405:*) err "this system has no client pairing (HTTP $1): make the token by hand (see the README)." ;;
+    422:*) err "the system does not offer backups through pairing (HTTP 422: $(json_field "$2" message)): that needs openccu-lite 1.1.0-beta.1 or later. Update it, or make the token by hand (see the README)." ;;
+    *) err "HTTP $1 from the system${e:+: $e}" ;;
+  esac
+}
+
+# pair_withdraw: take the waiting request back, so it does not stay on the Status page
+PAIR_URL=
+pair_withdraw() {
+  [ -n "$PAIR_URL" ] || return 0
+  curl_sys "$TMPD/pair.del" -X DELETE --max-time 20 "$PAIR_URL" >/dev/null
+  PAIR_URL=
+}
+
+# pair_main: ask the system for a token that holds only the backup scope, with HOST TOKEN_FILE CA
+# INSECURE set. POST the request with a commitment, read the certificate the system serves, reveal the
+# client nonce, show the code and wait for the administrator's answer.
+pair_main() {
+  [ -n "$HOST" ] && [ -n "$TOKEN_FILE" ] || { err "pair needs --host and --token-file"; usage >&2; return 2; }
+  case "$HOST" in
+    https://?*) ;;
+    http://*) err "$HOST is not https:// - the token would cross the network in the clear, and the code needs a certificate"; return 2 ;;
+    *) err "the host is https://name-or-address, not '$HOST'"; return 2 ;;
+  esac
+  HOST=${HOST%/}
+  instance=${D_INSTANCE:-$(uname -n 2>/dev/null | tr -cd 'A-Za-z0-9._-')}
+  case "$instance" in
+    *[!A-Za-z0-9._-]*) err "--instance holds letters, digits and . _ - only"; return 2 ;;
+  esac
+  if [ "$INSECURE" != yes ] && [ -n "$CA" ] && [ ! -r "$CA" ]; then
+    err "cannot read the CA file $CA"; return 1
+  fi
+  if { [ -e "$TOKEN_FILE" ] || [ -L "$TOKEN_FILE" ]; } && [ "$D_FORCE" != yes ]; then
+    err "$TOKEN_FILE exists; --force replaces it"; return 1
+  fi
+  # the token comes only once, so the place for it is tried first
+  PAIR_TMP="$TOKEN_FILE.tmp.$$"
+  if ! (set -C; : >"$PAIR_TMP") 2>/dev/null; then
+    PAIR_TMP=
+    err "cannot write beside $TOKEN_FILE (does its directory exist?)"; return 1
+  fi
+
+  # the host and port for openssl: name, name:port, [v6], [v6]:port
+  hp=${HOST#https://}
+  hp=${hp%%/*}
+  case "$hp" in
+    \[*\]) sni=; connect="$hp:443" ;;
+    \[*) sni=; connect=$hp ;;
+    *:*) sni=${hp%:*}; connect=$hp ;;
+    *) sni=$hp; connect="$hp:443" ;;
+  esac
+  # a name goes along in the TLS hello, an address does not
+  case "$sni" in *[!0-9.]*) ;; *) sni= ;; esac
+
+  client_nonce=$(openssl rand -hex 16) || { err "openssl rand failed"; return 1; }
+  case "$client_nonce" in
+    ????????????????????????????????) ;;
+    *) err "openssl rand gave no nonce"; return 1 ;;
+  esac
+  commit=$(hex_bytes "$client_nonce" | sha256_hex)
+
+  hdr="$TMPD/auth"
+  printf 'Content-Type: application/json\n' >"$hdr"
+  printf '{"app":"occulite-backup","app_version":"%s","instance":"%s","access":{"backup":"download"},"purpose":{"backup":"Downloads this system'"'"'s backups to %s"},"commit":"%s"}' \
+    "$VERSION" "$instance" "${instance:-this machine}" "$commit" >"$TMPD/pair.req"
+  api="$HOST/api/auth/v1/pairing/request"
+  out=$(curl_sys "$TMPD/pair.ans" -D "$TMPD/pair.head" -X POST --max-time 30 --data-binary "@$TMPD/pair.req" "$api")
+  rc=$?
+  [ "$rc" = 0 ] || { err "the system did not answer (curl $rc: $(curl_err))"; [ "$rc" != 60 ] || [ -n "$CA" ] || err "a self-signed certificate needs --ca (see the README)"; return 1; }
+  code=${out%% *}
+  [ "$code" = 202 ] || { pair_refused "$code" "$TMPD/pair.ans"; return 1; }
+  id=$(json_field "$TMPD/pair.ans" id)
+  poll=$(json_field "$TMPD/pair.ans" poll)
+  nonce=$(json_field "$TMPD/pair.ans" nonce)
+  served=$(json_field "$TMPD/pair.ans" fingerprint)
+  case "$id" in ''|*[!0-9A-Za-z_-]*) err "the system answered without a request id"; return 1 ;; esac
+  case "$poll" in ''|*[!0-9A-Za-z_-]*) err "the system answered without a poll secret"; return 1 ;; esac
+  case "$nonce" in ''|*[!0-9a-fA-F]*) err "the system answered without a nonce"; return 1 ;; esac
+  printf 'Authorization: Pairing %s\n' "$poll" >"$hdr"
+  PAIR_URL="$api/$id"
+  trap 'pair_withdraw; exit 1' HUP INT TERM
+
+  # the certificate this machine sees, which the code is bound to
+  if [ -n "$sni" ]; then
+    openssl s_client -connect "$connect" -servername "$sni" </dev/null 2>/dev/null | openssl x509 -outform DER >"$TMPD/cert.der" 2>/dev/null
+  else
+    openssl s_client -connect "$connect" </dev/null 2>/dev/null | openssl x509 -outform DER >"$TMPD/cert.der" 2>/dev/null
+  fi
+  [ -s "$TMPD/cert.der" ] || { pair_withdraw; err "could not read the certificate of $connect with openssl"; return 1; }
+  fp=$(sha256_hex <"$TMPD/cert.der")
+  # what follows must reach the server of that certificate, also with --insecure
+  PIN=$(openssl x509 -inform DER -in "$TMPD/cert.der" -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256 -binary | openssl base64)
+  [ -n "$PIN" ] || { pair_withdraw; err "could not read the certificate's key with openssl"; return 1; }
+  # another certificate than the system's own (a proxy in front of it, or someone in between): the
+  # two codes could never agree, and a wrong code would only mute this machine for ten minutes
+  if [ "$(printf '%s' "$served" | tr 'A-F' 'a-f')" != "$fp" ]; then
+    pair_withdraw
+    err "this machine sees another certificate than the one the system says it serves, so the codes could not agree."
+    err "  seen here:     $fp"
+    err "  system's own:  ${served:-none}"
+    err "Connect to the system directly, not through a proxy. If there is no proxy, someone may be in between."
+    return 1
+  fi
+
+  pcode=$(pair_code "$nonce" "$client_nonce" "$fp")
+  say "Asking $HOST for a token that can only make backups."
+  say "The certificate's SHA-256: $fp"
+  say ""
+  say "    Code: $pcode"
+  say ""
+  say "On the system's Status page, as an administrator: check that the request shows this code and"
+  say "this machine, then approve it with the code and your password or passkey. Only approve when the"
+  say "code is the same. A token is as sensitive as a backup: a backup holds the system's radio keys."
+  say "Waiting up to 5 minutes (Ctrl-C withdraws the request) ..."
+
+  deadline=$(($(now) + 330))
+  errs=0
+  while :; do
+    [ "$(now)" -lt "$deadline" ] || { pair_withdraw; err "no answer on the system within 5 minutes: the request has expired. Run pair again."; return 1; }
+    # the first poll reveals the client nonce; the system waits with its answer for up to 25 s
+    out=$(curl_sys "$TMPD/pair.ans" -D "$TMPD/pair.head" --max-time 45 "$PAIR_URL?wait=25&client_nonce=$client_nonce")
+    rc=$?
+    code=${out%% *}
+    [ "$rc" = 0 ] || code=000
+    case "$code" in
+      200)
+        errs=0
+        state=$(json_field "$TMPD/pair.ans" state)
+        case "$state" in
+          pending) ;;
+          approved) PAIR_URL=; break ;;
+          rejected) PAIR_URL=; err "the request was rejected on the system (or the code entered there was wrong). The system stays silent for this machine for ten minutes."; return 1 ;;
+          expired) PAIR_URL=; err "the request expired before anyone approved it. Run pair again."; return 1 ;;
+          *) err "the system answered the state '$state'"; pair_withdraw; return 1 ;;
+        esac ;;
+      404) PAIR_URL=; err "the system no longer knows the request (it expired, or the system restarted). Run pair again."; return 1 ;;
+      403) PAIR_URL=; pair_refused 403 "$TMPD/pair.ans"; return 1 ;;
+      429)
+        wait_s=$(header_value "$TMPD/pair.head" retry-after)
+        case "$wait_s" in ''|*[!0-9]*) wait_s=2 ;; esac
+        sleep "$wait_s" ;;
+      *)
+        # a network blip or a 5xx: the request waits on the system, try again a few times
+        errs=$((errs + 1))
+        [ "$errs" -lt 5 ] || { pair_withdraw; err "asking for the answer failed five times (HTTP $code, curl $rc: $(curl_err))"; return 1; }
+        sleep 2 ;;
+    esac
+  done
+
+  token=$(json_field "$TMPD/pair.ans" token)
+  name=$(json_field "$TMPD/pair.ans" name)
+  case "$token" in
+    ''|*[!A-Za-z0-9._~+/=-]*) err "the system approved, but its answer holds no usable token. Remove the token ${name:-it made} on the system and run pair again."; return 1 ;;
+  esac
+  if ! { printf '%s\n' "$token" >"$PAIR_TMP" && chmod 600 "$PAIR_TMP" && mv -f "$PAIR_TMP" "$TOKEN_FILE"; }; then
+    err "could not write $TOKEN_FILE, and the system hands a token out only once. Remove the token ${name:-it made} on the system and run pair again."
+    return 1
+  fi
+  PAIR_TMP=
+  say ""
+  say "Saved the token ${name:+$name }in $TOKEN_FILE (mode 0600)."
+  ips=$(json_list "$TMPD/pair.ans" ips)
+  [ -z "$ips" ] || say "It holds the backup scope only and works from $ips only."
+  say "Keep it as carefully as the backups themselves. Next:"
+  if [ "$INSECURE" = yes ]; then cert=" --insecure"; elif [ -n "$CA" ]; then cert=" --ca $CA"; else cert=; fi
+  say "  $PROG --host $HOST --token-file $TOKEN_FILE$cert --target DIR --keep 14"
+  return 0
+}
+
 set_defaults() {
   HOST=$D_HOST; TOKEN_FILE=$D_TOKEN_FILE; CA=$D_CA; INSECURE=$D_INSECURE; TARGET=$D_TARGET
   KEEP=$D_KEEP; NAME=$D_NAME; TIMEOUT=$D_TIMEOUT; POLL=$D_POLL
 }
+
+if [ "$MODE" = pair ]; then
+  set_defaults
+  pair_main
+  exit $?
+fi
 
 failed=0
 total=0

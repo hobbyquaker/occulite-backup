@@ -3,7 +3,7 @@
 [Deutsch](README.de.md)
 
 Downloads the backups of [openccu-lite](https://github.com/hobbyquaker/openccu-lite) systems: one POSIX shell
-script, `curl` its only dependency. It runs on a Linux server, on a NAS (Synology, QNAP) and on a router with
+script, `curl` its only dependency for the backups (`openssl` as well for `pair`, the step that gets the token). It runs on a Linux server, on a NAS (Synology, QNAP) and on a router with
 busybox, from cron or a systemd timer.
 
 - has the system build a fresh backup and downloads it, with an API token that may do nothing but backups: it starts
@@ -30,11 +30,40 @@ sha256sum -c occulite-backup.sha256
 install -m 0755 occulite-backup /usr/local/bin/occulite-backup
 ```
 
-It needs `curl` 7.55 or newer (2017), `tar`, and a POSIX shell (`sh`, `dash`, `bash`, busybox `ash`).
+It needs `curl` 7.55 or newer (2017), `tar`, and a POSIX shell (`sh`, `dash`, `bash`, busybox `ash`). `occulite-backup pair`
+needs `openssl` as well; the backups themselves do not.
 
 ## 1. A token that can only make backups
 
-On the openccu-lite system, as an administrator:
+**Pairing needs openccu-lite 1.1.0-beta.1 or later;** on an older system make the token by hand, see below.
+
+Run this on the machine that will run the backups. A system with its self-signed certificate needs step 2 first.
+
+```sh
+install -d -m 0700 /etc/occulite-backup
+occulite-backup pair --host https://ccu.example --token-file /etc/occulite-backup/ccu.token \
+  --ca /etc/occulite-backup/ccu.pem
+```
+
+The script shows a six-digit code and waits for up to five minutes. On the system's **Status** page, as an
+administrator, compare the code and the machine's name and address with the request, then approve it with the code and your
+password or passkey. The script saves the token with mode 0600 and prints the next command. It never overwrites a token
+file unless you add `--force`; `--instance NAME` sets the name the Status page shows (default: the host name).
+
+The token can do backups and nothing else, and it works only from the address that asked: an IPv4 address exactly, an IPv6
+address with its /64. When the system's name also resolves to IPv6, the nightly run must use the same address family as
+`pair`: give `--host` the same name or address in both.
+
+**A token is as sensitive as a backup.** A backup holds the radio keys of the system, and this token can fetch it, also
+unencrypted (`?encrypted=false`). Revoke it under **System → Remote access → API tokens** when the machine goes away.
+
+`pair` needs `openssl`, for the certificate's fingerprint and the code. The system takes such requests from its local
+networks only (firewall: *local networks*) and only while **Allow programs to ask for access** is on in the API tokens
+panel.
+
+### By hand
+
+On any openccu-lite system, as an administrator:
 
 1. **System → Remote access → API tokens → New token**.
 2. Name: e.g. `nas-backup`.
@@ -195,6 +224,11 @@ journalctl -u occulite-backup.service     # the last runs
 
 | Message | |
 | --- | --- |
+| `the system does not take pairing requests` | `pair`: **Allow programs to ask for access** is off (System → Remote access → API tokens) |
+| `the system takes pairing requests from its local networks only` | `pair`: this machine's address is outside the firewall's *local networks*; pair from one, or make the token by hand |
+| `the system refuses for now` (HTTP 429) | `pair`: one request at a time, ten an hour, and ten minutes of silence after a rejection or a wrong code |
+| `the system does not offer backups through pairing` | `pair`: the system is older than openccu-lite 1.1.0-beta.1 |
+| `another certificate than the one the system says it serves` | `pair`: a proxy in front of the system, or someone in between; connect directly |
 | `HTTP 401: the token is not accepted` | a wrong, expired or deleted token - or one not allowed from the address the request came from (IPv6, see step 1) |
 | `HTTP 403` | the token lacks the *Backups* permission |
 | `curl 60 … self-signed certificate` | `--ca` is missing or names another certificate (step 2) |
@@ -215,7 +249,8 @@ from the system's own download; it also restores on OpenCCU and a CCU3.
 
 `sh tests/run.sh` runs the script against `tests/stub.py`, an HTTPS stand-in for the system's backup API (a token
 check, the prepared backup with its polling, a busy system, a backup that fails, expires or never gets ready and is
-then cancelled, a cancel on `SIGTERM`, the plain download of an older system over HTTP/1.1, the file stream, 401,
+then cancelled, a cancel on `SIGTERM`, client pairing with the code checked against fixed vectors from the system's
+implementation and every refusal, the plain download of an older system over HTTP/1.1, the file stream, 401,
 403, 500, a truncated download, a broken archive, a tar that is no CCU backup, the encrypted variant, `--keep`, a
 config with several systems). It needs `python3`, `openssl`, `curl`, `tar` and `timeout`; `TEST_SH="busybox sh"`
 runs the script under busybox. Every run of the script in it is ended after 60 seconds, and the suite stops when

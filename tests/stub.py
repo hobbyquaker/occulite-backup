@@ -8,6 +8,9 @@ HTTPS on 127.0.0.1 with the certificate given. It answers
   DELETE /api/system/v1/backup/prepare/{id}   204, the job cancelled
   GET    /api/system/v1/backup?prepared={id}  the prepared file (409 running, 410 gone, 404 unknown)
   GET    /api/system/v1/backup                the file at once (a system before 1.0.0-beta.12)
+  POST   /api/auth/v1/pairing/request         client pairing: the request (see below)
+  GET    /api/auth/v1/pairing/request/{id}    its poll, Authorization: Pairing <poll>
+  DELETE /api/auth/v1/pairing/request/{id}    withdrawn, 204
 
 and writes every request as "<METHOD> <path> <token mode>" to the events file. The token picks
 what it answers:
@@ -33,20 +36,38 @@ what it answers:
   e500.<host>     500 for prepare and for GET /backup
   noscope.<host>  403
   anything else   401
+The pairing request's instance picks what the pairing answers; the code the system would show goes to
+the events file as "PAIRCODE <code>":
+
+  approve    approved at the second poll, with the token good.paired-host
+  now        approved at the first poll
+  slowdown   the first poll is 429 slow_down, then approved
+  blip       two polls answer 503, then approved
+  reject     rejected        expire    expired     gone      404 at the first poll
+  wait       pending for ever (a poll takes a second)
+  badtoken   approved, with a token that holds a blank
+  off        403 pairing-off     notlocal  403 not-local    limit  429 limit
+  old        422 (a system whose pairing has no backup area)        none   404
+  proxy      answers the fingerprint of another certificate
 Every answer's backup name carries a minute that counts up per request, so names differ.
 """
+import hashlib
 import io
 import json
 import ssl
 import sys
 import tarfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 P = "/api/system/v1/backup"
 lock = threading.Lock()
-state = {"n": 0, "jobs": {}, "busy": set(), "events": None}
+state = {"n": 0, "jobs": {}, "busy": set(), "events": None, "cert": b"", "pairs": {}}
+PAIR = "/api/auth/v1/pairing/request"
+# the system's half of the code, with the bytes a shell loses most easily: NUL, newline, %, backslash, quotes
+PAIR_NONCE = "00ff0a0d25275c22000102030405060a"
 
 
 def sbk():
@@ -94,8 +115,68 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return mode, host or "ccu"
 
+    def event(self, text):
+        with lock:
+            with open(state["events"], "a") as f:
+                f.write(text + "\n")
+
+    def pair_ask(self):
+        ask = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        mode = ask.get("instance", "")
+        self.event(f"POST {PAIR} {mode} {self.headers.get('Content-Type')}")
+        refuse = {"off": (403, "pairing-off"), "notlocal": (403, "not-local"), "limit": (429, "limit"),
+                  "old": (422, "invalid"), "none": (404, "not_found")}.get(mode)
+        if refuse:
+            head = {"Retry-After": "60"} if refuse[0] == 429 else {}
+            return self.send(refuse[0], json.dumps({"error": refuse[1], "message": "the stub says no"}).encode(), head)
+        if ask.get("app") != "occulite-backup" or ask.get("access") != {"backup": "download"} or len(ask.get("commit", "")) != 64:
+            return self.send_json(422, {"error": "invalid", "message": "a wrong ask"})
+        with lock:
+            state["n"] += 1
+            rid = "%016x" % state["n"]
+            state["pairs"][rid] = {"mode": mode, "commit": ask["commit"], "polls": 0, "revealed": False}
+        fp = hashlib.sha256(state["cert"]).hexdigest()
+        self.send_json(202, {"id": rid, "poll": "poll-" + rid, "nonce": PAIR_NONCE, "expires_in": 300, "interval": 2,
+                             "fingerprint": "ab" * 32 if mode == "proxy" else fp})
+
+    def pair_poll(self, rid, q):
+        with lock:
+            r = state["pairs"].get(rid)
+        if r is None:
+            return self.send_json(404, {"error": "not_found"})
+        self.event(f"GET {PAIR}/{{id}} {r['mode']}")
+        if self.headers.get("Authorization") != "Pairing poll-" + rid:
+            return self.send_json(403, {"error": "forbidden"})
+        cn = q.get("client_nonce", [""])[0]
+        if not r["revealed"]:
+            if len(cn) < 32 or hashlib.sha256(bytes.fromhex(cn)).hexdigest() != r["commit"]:
+                return self.send_json(422, {"error": "invalid", "message": "client_nonce does not match the commitment"})
+            r["revealed"] = True
+            d = hashlib.sha256(bytes.fromhex(PAIR_NONCE) + bytes.fromhex(cn) + hashlib.sha256(state["cert"]).digest()).digest()
+            self.event("PAIRCODE %06d" % (int.from_bytes(d[:4], "big") % 1000000))
+        r["polls"] += 1
+        mode, n = r["mode"], r["polls"]
+        ok = {"state": "approved", "token": "good.paired-host", "name": "occulite-backup-" + mode, "scopes": ["backup"],
+              "access": {"backup": "download"}, "ips": ["127.0.0.1/32"]}
+        if mode == "wait" or (mode == "approve" and n < 2):
+            time.sleep(1 if mode == "wait" else 0)
+            return self.send_json(200, {"state": "pending"})
+        if mode == "slowdown" and n == 1:
+            return self.send(429, b'{"error":"slow_down"}', {"Retry-After": "1"})
+        if mode == "blip" and n <= 2:
+            return self.send_json(503, {"error": "unavailable"})
+        if mode in ("reject", "expire"):
+            return self.send_json(200, {"state": {"reject": "rejected", "expire": "expired"}[mode]})
+        if mode == "gone":
+            return self.send_json(404, {"error": "not_found"})
+        if mode == "badtoken":
+            ok["token"] = "not a token"
+        return self.send_json(200, ok)
+
     def do_POST(self):
         url = urlsplit(self.path)
+        if url.path == PAIR:
+            return self.pair_ask()
         if url.path != P + "/prepare":
             return self.send_json(404, {"error": "not_found"})
         who = self.auth()
@@ -118,6 +199,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         url = urlsplit(self.path)
+        if url.path.startswith(PAIR + "/"):
+            with lock:
+                r = state["pairs"].pop(url.path.rsplit("/", 1)[1], None)
+            self.event(f"DELETE {PAIR}/{{id}} {r['mode'] if r else '-'}")
+            self.send_response(204)
+            self.end_headers()
+            return
         if not url.path.startswith(P + "/prepare/"):
             return self.send_json(404, {"error": "not_found"})
         if self.auth() is None:
@@ -133,6 +221,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlsplit(self.path)
+        if url.path.startswith(PAIR + "/"):
+            return self.pair_poll(url.path.rsplit("/", 1)[1], parse_qs(url.query))
         if url.path.startswith(P + "/prepare/"):
             return self.poll(url.path.rsplit("/", 1)[1])
         if url.path != P:
@@ -237,6 +327,8 @@ def public(job):
 def main():
     port, cert, key, portfile, events = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
     state["events"] = events
+    with open(cert) as f:
+        state["cert"] = ssl.PEM_cert_to_DER_cert(f.read())
     open(events, "w").close()
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     srv.daemon_threads = True
