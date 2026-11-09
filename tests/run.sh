@@ -184,7 +184,7 @@ out=$(sut --host "$URL" --poll 0 2>&1); rc=$?
 [ "$rc" = 2 ] && ok "--poll 0: a usage error" || bad "--poll 0: rc $rc"
 out=$(sut 2>&1); rc=$?
 [ "$rc" = 2 ] && echo "$out" | grep -q '^Usage:' && ok "no host: the usage, exit 2" || bad "no host: rc $rc"
-out=$(sut --version); [ "$out" = "occulite-backup 1.1.0" ] && ok "--version" || bad "--version: $out"
+out=$(sut --version); [ "$out" = "occulite-backup 1.1.1" ] && ok "--version" || bad "--version: $out"
 fresh
 : >"$T/empty"
 out=$(sut --host "$URL" --token-file "$T/empty" --ca "$T/cert.pem" --target "$T/target" 2>&1); rc=$?
@@ -303,6 +303,19 @@ out=$(sut --host "$URL" --token-file "$T/paired.token" --ca "$T/cert.pem" --poll
 [ "$rc" = 0 ] && [ "$(count)" = 1 ] && ok "pair: the token it saved downloads a backup" || bad "paired backup: rc $rc, $out"
 no_pair_tmp() { [ -z "$(find "$T" -maxdepth 1 -name 'paired.token.tmp*')" ]; }
 no_pair_tmp && ok "pair: no temporary file left" || bad "pair left its temporary file"
+
+# --- by name: openssl reads the certificate from the address curl reached, the name only in the TLS
+# hello (openssl has no fallback between addresses and no connect timeout: an IPv6 address that does
+# not answer on the port hung pair for minutes before the request ever reached the Status page)
+mkdir -p "$T/osshim"
+REAL_OPENSSL=$(command -v openssl)
+printf '#!/bin/sh\necho "$*" >>"%s"\nexec "%s" "$@"\n' "$T/openssl.args" "$REAL_OPENSSL" >"$T/osshim/openssl"
+chmod 755 "$T/osshim/openssl"
+: >"$EV"; : >"$T/openssl.args"; rm -f "$T/paired.token"
+port=$(cat "$T/port")
+out=$(PATH="$T/osshim:$PATH" sut pair --host "https://localhost:$port" --token-file "$T/paired.token" --insecure --instance approve 2>&1); rc=$?
+[ "$rc" = 0 ] && grep -q "^s_client -connect 127.0.0.1:$port -servername localhost\$" "$T/openssl.args" \
+  && ok "pair by name: openssl connects to the address curl used, the name as SNI" || bad "pair by name: rc $rc, $out, $(cat "$T/openssl.args")"
 
 # --- an existing token file: refused before anything is asked, --force replaces it
 printf 'old-token\n' >"$T/paired.token"

@@ -17,7 +17,7 @@ set -u
 # a backup holds the system's radio keys: what this script writes is the user's alone
 umask 077
 
-VERSION=1.1.0
+VERSION=1.1.1
 PROG=occulite-backup
 
 usage() {
@@ -163,7 +163,7 @@ PIN=
 curl_sys() {
   o=$1
   shift
-  set -- -sS -o "$o" -w '%{http_code} %{size_download}' -H "@$hdr" --connect-timeout 30 --proto '=https' --tlsv1.2 "$@"
+  set -- -sS -o "$o" -w '%{http_code} %{size_download} %{remote_ip}' -H "@$hdr" --connect-timeout 30 --proto '=https' --tlsv1.2 "$@"
   [ -z "$PIN" ] || set -- --pinnedpubkey "sha256//$PIN" "$@"
   if [ "$INSECURE" = yes ]; then
     set -- -k "$@"
@@ -346,6 +346,7 @@ backup_one() {
   fi
   code=${out%% *}
   got=${out#* }
+  got=${got%% *}
   if [ "$rc" != 0 ]; then
     fail "the download failed (curl $rc: $(curl_err))"; return 1
   fi
@@ -468,6 +469,14 @@ pair_main() {
   rc=$?
   [ "$rc" = 0 ] || { err "the system did not answer (curl $rc: $(curl_err))"; [ "$rc" != 60 ] || [ -n "$CA" ] || err "a self-signed certificate needs --ca (see the README)"; return 1; }
   code=${out%% *}
+  # the address curl reached the system on: openssl has no fallback between addresses and no connect
+  # timeout, so a name whose IPv6 address does not answer on the port would hang it for minutes
+  ip=${out##* }
+  case "$ip" in
+    *[!0-9A-Fa-f.:]*|'') ;;
+    *:*) connect="[$ip]:${connect##*:}" ;;
+    *) connect="$ip:${connect##*:}" ;;
+  esac
   [ "$code" = 202 ] || { pair_refused "$code" "$TMPD/pair.ans"; return 1; }
   id=$(json_field "$TMPD/pair.ans" id)
   poll=$(json_field "$TMPD/pair.ans" poll)
