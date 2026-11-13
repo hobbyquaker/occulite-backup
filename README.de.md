@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-Lädt die Sicherungen von [openccu-lite](https://github.com/hobbyquaker/openccu-lite)-Systemen herunter: ein
+Lädt die Sicherungen von [openccu-lite](https://github.com/openccu-lite/openccu-lite)-Systemen herunter: ein
 POSIX-Shell-Skript, einzige Abhängigkeit für die Sicherungen ist `curl` (für `pair`, den Schritt zum Token, auch `openssl`). Es läuft auf einem Linux-Server, einem NAS (Synology, QNAP) und
 einem Router mit busybox, per cron oder systemd-Timer.
 
@@ -24,8 +24,8 @@ einem Router mit busybox, per cron oder systemd-Timer.
 ## Installation
 
 ```sh
-curl -fsSLO https://github.com/hobbyquaker/occulite-backup/releases/latest/download/occulite-backup
-curl -fsSLO https://github.com/hobbyquaker/occulite-backup/releases/latest/download/occulite-backup.sha256
+curl -fsSLO https://github.com/openccu-lite/occulite-backup/releases/latest/download/occulite-backup
+curl -fsSLO https://github.com/openccu-lite/occulite-backup/releases/latest/download/occulite-backup.sha256
 sha256sum -c occulite-backup.sha256
 install -m 0755 occulite-backup /usr/local/bin/occulite-backup
 ```

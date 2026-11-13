@@ -2,7 +2,7 @@
 
 [Deutsch](README.de.md)
 
-Downloads the backups of [openccu-lite](https://github.com/hobbyquaker/openccu-lite) systems: one POSIX shell
+Downloads the backups of [openccu-lite](https://github.com/openccu-lite/openccu-lite) systems: one POSIX shell
 script, `curl` its only dependency for the backups (`openssl` as well for `pair`, the step that gets the token). It runs on a Linux server, on a NAS (Synology, QNAP) and on a router with
 busybox, from cron or a systemd timer.
 
@@ -24,8 +24,8 @@ busybox, from cron or a systemd timer.
 ## Install
 
 ```sh
-curl -fsSLO https://github.com/hobbyquaker/occulite-backup/releases/latest/download/occulite-backup
-curl -fsSLO https://github.com/hobbyquaker/occulite-backup/releases/latest/download/occulite-backup.sha256
+curl -fsSLO https://github.com/openccu-lite/occulite-backup/releases/latest/download/occulite-backup
+curl -fsSLO https://github.com/openccu-lite/occulite-backup/releases/latest/download/occulite-backup.sha256
 sha256sum -c occulite-backup.sha256
 install -m 0755 occulite-backup /usr/local/bin/occulite-backup
 ```
